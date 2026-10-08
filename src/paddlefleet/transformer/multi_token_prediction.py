@@ -15,10 +15,13 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import paddle
 from paddle import Tensor, nn
 from paddle.distributed.fleet.meta_parallel import (
@@ -31,13 +34,21 @@ from paddle.distributed.fleet.utils.sequence_parallel_utils import (
     ScatterOp,
     mark_as_sequence_parallel_parameter,
 )
+from paddle.distributed.flex_checkpoint.aoa.generation import (
+    resolve_single_name,
+)
 
 from paddlefleet import tensor_parallel
 from paddlefleet.context_parallel_utils import ContextParallelScatterOp
 from paddlefleet.parallel_state import (
+    get_context_parallel_rank,
     get_context_parallel_world_size,
 )
 from paddlefleet.process_groups_config import ProcessGroupCollection
+from paddlefleet.tensor_parallel.layers import (
+    gen_linear_aoa_statements,
+    gen_linear_inv_aoa_statements,
+)
 from paddlefleet.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -46,11 +57,14 @@ from paddlefleet.tensor_parallel.random import get_cuda_rng_tracker
 from paddlefleet.transformer.dw_overlap import deferrable_linear
 from paddlefleet.transformer.enums import AttnMaskType
 from paddlefleet.transformer.layer import FleetLayer
+from paddlefleet.utils import use_dsv4_accuracy_compatible
 
 if TYPE_CHECKING:
     from paddlefleet.models.backends import BackendSpecProvider
     from paddlefleet.packed_seq_params import PackedSeqParams
     from paddlefleet.transformer.transformer_config import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding,
@@ -761,6 +775,116 @@ class MTPLossAutoScaler(paddle.autograd.PyLayer):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+_MTP_SAMPLING_STEP_ENV = ("TRAINER_GLOBAL_STEP", "PDC_INIT_STEP")
+_warned_missing_train_step = False
+
+
+def _current_train_step():
+    """The optimizer step this micro-batch belongs to, or 0 if unknown.
+
+    ``Trainer.train()`` exports ``TRAINER_GLOBAL_STEP`` once per micro-batch,
+    unconditionally, right after loading the batch. Reading it here is what lets
+    the depth draw be a pure function of the step: no per-layer counters, no
+    resume bookkeeping, and every rank and pipeline stage derives the same K for
+    the same step without communicating.
+
+    These are not new variables invented for sampling: ``recompute_utils``'s
+    ``has_recovered()`` already reads exactly this pair, in this order, and the
+    pretraining trainers already write ``TRAINER_GLOBAL_STEP``. Mirroring that
+    reader keeps one contract in the repo rather than two.
+
+    A training loop that exports neither leaves the step at 0, which makes K
+    constant for the whole run -- correct (``w_j = E[1{K>=j}/K]`` depends only on
+    the configured distribution) but not sampling anything. That is worth a
+    warning rather than a silent degradation, so warn once.
+    """
+    global _warned_missing_train_step
+    for name in _MTP_SAMPLING_STEP_ENV:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            # A malformed value is a broken launcher, not a missing one; fall
+            # through to the next name rather than trusting it.
+            continue
+    if not _warned_missing_train_step:
+        _warned_missing_train_step = True
+        logger.warning(
+            "mtp_depth_sampling is on but none of "
+            f"{'/'.join(_MTP_SAMPLING_STEP_ENV)} holds a usable step, so the "
+            "sampled depth cannot advance and K stays constant for the whole "
+            "run. The trainer is expected to export TRAINER_GLOBAL_STEP once "
+            "per micro-batch."
+        )
+    return 0
+
+
+def draw_mtp_sampled_depth(config):
+    """Draw K -- how many MTP depths (prefix 1..K) to run this optimizer step.
+
+    Driven by ``config.mtp_depth_sampling``, a list P(K=k) of length
+    D=num_nextn_predict_layers. Returns D when sampling is disabled.
+
+    K is a PURE FUNCTION of ``config.seed`` and the current train step, so it is
+    deterministic, collective-free and identical on every rank, every pipeline
+    stage and every virtual chunk that asks -- no counters to keep in lockstep and
+    nothing to align. A world-group ``broadcast(src=0)`` -- the original mechanism
+    -- deadlocks at pp>1 instead, because only the last pipeline stage runs the
+    MTP layers while src=0 sits on the first stage and never joins.
+
+    Granularity is one draw per OPTIMIZER step, not per micro-batch: the step only
+    advances once per optimizer update, so all micro-batches of a step run the same
+    depths. That keeps every micro-batch's cost identical, which matters for
+    pipeline balance, and it makes a recompute replay trivially idempotent. The
+    effective per-depth weight is unchanged -- ``w_j = E[1{K>=j}/K]`` depends only
+    on the configured distribution, not on how finely K is redrawn -- and a resumed
+    job continues the sequence for free, because the step comes from the restored
+    checkpoint state.
+
+    A private Generator is used (not ``np.random.*``) so the global RNG stream
+    used elsewhere is untouched.
+
+    ``config.seed`` is read with a default of 0 on purpose: TransformerConfig
+    carries no seed field of its own today, so in-tree the draw is a function of
+    the step alone -- which is what makes two runs of the same config reproduce
+    each other. A downstream config that does carry a seed decorrelates otherwise
+    identical runs for free, with ``base * 1_000_003`` keeping the per-seed
+    streams disjoint for any realistic step count.
+    """
+    d = config.num_nextn_predict_layers
+    ratio = getattr(config, "mtp_depth_sampling", None)
+    if not ratio:
+        return d
+    probs = np.asarray(ratio, dtype="float64")
+    probs = probs / probs.sum()
+    base = int(getattr(config, "seed", 0) or 0)
+    seed = base * 1_000_003 + _current_train_step()
+    rng = np.random.default_rng(seed)
+    k = int(rng.choice(len(probs), p=probs)) + 1
+    return max(1, min(k, d))
+
+
+def resolve_mtp_sampled_depth(config, dict_args):
+    """Return this micro-batch's K, deriving it if nobody published one yet.
+
+    Every site would derive the same value anyway -- K is a pure function of
+    (seed, step) -- so the ``dict_args`` entry is a cache, not a synchronisation
+    mechanism: it saves the later MTP depths and the LM head on a stage from
+    recomputing the draw, and it makes the value visibly identical for anyone
+    reading the dict.
+    """
+    if "mtp_sampled_depth" in dict_args:
+        return dict_args["mtp_sampled_depth"]
+    k = draw_mtp_sampled_depth(config)
+    dict_args["mtp_sampled_depth"] = k
+    return k
+
+
+_AOA_DROP_SEGMENT = "transformer_layer"
+
+
 class MultiTokenPredictionLayer(FleetLayer):
     """The implementation for Multi-Token Prediction (MTP) which extends
     the prediction scope to multiple future tokens at each position.
@@ -861,10 +985,13 @@ class MultiTokenPredictionLayer(FleetLayer):
             # Learned contraction parameters for MTP output
             n = config.num_residual_streams
             hc_dim = config.hidden_size * n
-            # learned_output_contract() computes in fp32; store the parameters
-            # in fp32 too (Megatron marks hc_head_* keep_in_fp32).
-
-            hc_param_dtype = "float32"
+            # The canonical DSV4 replay stores these parameters in model dtype;
+            # learned_output_contract() still widens the computation internally.
+            hc_param_dtype = (
+                config.params_dtype
+                if use_dsv4_accuracy_compatible()
+                else "float32"
+            )
             self.hc_head_fn = self.create_parameter(
                 shape=[hc_dim, n],
                 dtype=hc_param_dtype,
@@ -975,7 +1102,9 @@ class MultiTokenPredictionLayer(FleetLayer):
                 reduce_scatter_embeddings=False,
                 config=no_init_cfg,
             )
-            if self.config.context_parallel_size > 1:
+            if self.config.context_parallel_size > 1 and not getattr(
+                config, "use_erndata", False
+            ):
                 from paddlefleet.context_parallel_utils import (
                     mark_context_parallel_parameter_disable_scale_grad,
                 )
@@ -983,19 +1112,164 @@ class MultiTokenPredictionLayer(FleetLayer):
                 mark_context_parallel_parameter_disable_scale_grad(
                     self.mtp_embed
                 )
+            # Erndata keeps default CP scaling on both the stage-0 embedding and
+            # this physical copy. Disabling it only here would make their shared
+            # gradient contributions use different scales before PP all-reduce.
 
-            from paddlefleet.models.gpt.mtp_embedding_layer import (
-                mtp_magic_instance,
-            )
+            if not getattr(config, "use_erndata", False):
+                from paddlefleet.models.gpt.mtp_embedding_layer import (
+                    mtp_magic_instance,
+                )
 
-            self.magic_key = f"mtp_layer_{self.layer_number}"
-            mtp_magic_instance.set_magic_count(self.magic_key, -1)
+                self.magic_key = f"mtp_layer_{self.layer_number}"
+                mtp_magic_instance.set_magic_count(self.magic_key, -1)
 
         self.offload_context = nullcontext()
 
     @property
     def transformer_layer_weights(self):
         return self.transformer_layer.named_parameters()
+
+    @property
+    def all_weights(self):
+        """Every parameter of this MTP depth: the transformer_layer body plus the
+        per-depth fusion modules (enorm / hnorm / eh_proj or e_proj+h_proj / norm).
+
+        Used as ``shared_weight_attr`` for the ``mtp_shared_weights`` key so that
+        paddle registers all of them in ``PipelineLayer.shared_comm`` -- unlike
+        ``transformer_layer_weights``, which deliberately covers the body only.
+
+        ``mtp_embed`` is excluded. Under enable_mtp_magic_send it is a real
+        VocabParallelEmbedding sublayer, but GPTModel already owns it end to end:
+        _tie_mtp_embed_weights_intra_rank shares it within a rank,
+        _create_mtp_embed_global_group / _synchronize_mtp_embed_weight sync it across
+        stages, and _mark_mtp_embed_shared_flags sets its is_firstly_shared.
+        Registering it in shared_comm as well would give its initial broadcast two
+        competing sources (stage 0 over the pipe group vs the shared group's lowest
+        rank), tag it with a sharding-sync ``color`` it does not want, and leave
+        is_firstly_shared decided by whichever mechanism ran last. The gradient
+        itself is already safe -- GPTModel.allreduce_shared_weight_gradients skips
+        mtp_embed by Parameter identity -- but the remaining three are not.
+        """
+        for name, param in self.named_parameters():
+            if name.startswith("mtp_embed."):
+                continue
+            yield name, param
+
+    def _mtp_embed_model_names(self, ctx, structured_name_prefix):
+        """Yields the model-side name of every tensor ``mtp_embed`` owns.
+
+        ``enable_mtp_magic_send`` gives this block a private copy of the token
+        embedding, so the copy has model keys of its own while the checkpoint
+        still holds a single embedding tensor. The standard recursion resolves
+        those keys to themselves and so emits nothing for them, which is why
+        both directions state the copy's rule here. Yields nothing when the
+        block has no copy.
+
+        Both directions call this: it only computes names, so neither
+        direction's statements are derived from the other's.
+        """
+        if self.mtp_embed is None:
+            return
+        own_state_dict = self.mtp_embed.state_dict(
+            structured_name_prefix="", include_sublayers=False
+        )
+        for local_name in own_state_dict:
+            yield resolve_single_name(
+                local_name,
+                f"{structured_name_prefix}mtp_embed.",
+                ctx.pp_to_single_mapping,
+                ctx.model_name_prefix,
+            )
+
+    def gen_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        """Checkpoint->model AOA for this block and everything under it.
+
+        Declares the subtree's drop segment and otherwise leaves the walk to
+        the standard recursion, so the inner transformer layer and its
+        components emit their own rules. An MTP block is always registered as a
+        top-level pipeline layer, never inside another subtree, so there is no
+        inherited segment to keep.
+
+        Two children need a rule stated here. In the experimental version
+        ``eh_proj`` is an upstream ``paddle.incubate.nn.FusedLinear`` with no AOA
+        override of its own, so the recursion only same-name passes its
+        ``[in, out]`` weight and its ``^T`` is supplied via the shared Linear
+        helper; other versions build ``eh_proj`` as a Linear-family layer that
+        already emits that ``^T`` in the recursion, so nothing is added here.
+        A private embedding copy is filled from the one embedding tensor the
+        checkpoint holds, the same tensor the model root's embedding reads.
+        """
+        # Function-local: the GPT model package imports this module, so a
+        # module-level import back into it would be circular.
+        from paddlefleet.models.gpt.lm_head import (
+            resolve_embedding_checkpoint_name,
+        )
+
+        statements = super().gen_aoa_statements(
+            ctx,
+            structured_name_prefix=structured_name_prefix,
+            checkpoint_lookup_drop_segment=_AOA_DROP_SEGMENT,
+        )
+        if (
+            self.eh_proj is not None
+            and self.config.gpt_model_use_experimental_version
+        ):
+            statements += gen_linear_aoa_statements(
+                self.eh_proj,
+                ctx,
+                structured_name_prefix=f"{structured_name_prefix}eh_proj.",
+                checkpoint_lookup_drop_segment=_AOA_DROP_SEGMENT,
+            )
+        for model_name in self._mtp_embed_model_names(
+            ctx, structured_name_prefix
+        ):
+            statements.append(
+                f"{resolve_embedding_checkpoint_name(ctx)} -> {model_name}"
+            )
+        return statements
+
+    def gen_inv_aoa_statements(
+        self,
+        ctx,
+        *,
+        structured_name_prefix="",
+        checkpoint_lookup_drop_segment=None,
+    ):
+        """Inverse (model -> checkpoint) AOA, independently generated.
+
+        In the experimental version ``eh_proj``'s weight is transposed back here
+        for the same reason the forward direction supplies its ``^T``; other
+        versions leave it to the recursion. A private embedding copy is not
+        written: the checkpoint keeps one embedding tensor and the model root's
+        embedding is what writes it.
+        """
+        statements = super().gen_inv_aoa_statements(
+            ctx,
+            structured_name_prefix=structured_name_prefix,
+            checkpoint_lookup_drop_segment=_AOA_DROP_SEGMENT,
+        )
+        if (
+            self.eh_proj is not None
+            and self.config.gpt_model_use_experimental_version
+        ):
+            statements += gen_linear_inv_aoa_statements(
+                self.eh_proj,
+                ctx,
+                structured_name_prefix=f"{structured_name_prefix}eh_proj.",
+                checkpoint_lookup_drop_segment=_AOA_DROP_SEGMENT,
+            )
+        for model_name in self._mtp_embed_model_names(
+            ctx, structured_name_prefix
+        ):
+            statements.append(f"{model_name} -> _")
+        return statements
 
     def _concat_embeddings(
         self,
@@ -1070,21 +1344,31 @@ class MultiTokenPredictionLayer(FleetLayer):
                 hs_streams = hs_streams * mtp_hidden_inputs_mask.unsqueeze(-1)
 
             # e_proj: [.., h] -> [.., h/tp]
-            e_out, _ = deferrable_linear(
-                self.config, "mtp_e_proj", self.e_proj, decoder_input
-            )
-            # h_proj: applied per-stream [.., n, h] -> [.., n, h/tp]
-            # 4D tensor causes .t() error in backward; reshape to 3D first.
-            orig_shape = list(hs_streams.shape)
-            if self.tensor_parallel > 1 and self.sequence_parallel:
-                # Sequence-parallel linear all-gathers the seq axis, which is
-                # axis 0 in the seq-first layout that sequence_parallel implies.
-                orig_shape[0] = orig_shape[0] * self.tensor_parallel
-            hs_flat = hs_streams.reshape([-1, orig_shape[-1]])  # [s/sp*b*n, h]
-            h_out, _ = deferrable_linear(
-                self.config, "mtp_h_proj", self.h_proj, hs_flat
-            )  # [s*b*n, h/tp]
-            h_out = h_out.reshape([*orig_shape[:-1], -1])  # [s, b, n, h/tp]
+            if use_dsv4_accuracy_compatible():
+                e_out, _ = self.e_proj(decoder_input)
+                hs_seqfirst = hs_streams.transpose([1, 0, 2, 3]).contiguous()
+                seqfirst_shape = hs_seqfirst.shape
+                hs_flat = hs_seqfirst.reshape([-1, seqfirst_shape[-1]])
+                h_out, _ = self.h_proj(hs_flat)
+                h_out = h_out.reshape([*seqfirst_shape[:-1], -1])
+                h_out = h_out.transpose([1, 0, 2, 3]).contiguous()
+            else:
+                e_out, _ = deferrable_linear(
+                    self.config, "mtp_e_proj", self.e_proj, decoder_input
+                )
+                # h_proj: applied per-stream [.., n, h] -> [.., n, h/tp]
+                # 4D tensor [b,s,n,h] causes .t() error in backward; reshape to 3D first
+                orig_shape = list(hs_streams.shape)  # [s/sp, b, n, h]
+                if self.tensor_parallel > 1 and self.sequence_parallel:
+                    # [s/sp, b, n, h] --> [s, b, n, h]
+                    orig_shape[0] = orig_shape[0] * self.tensor_parallel
+                hs_flat = hs_streams.reshape(
+                    [-1, orig_shape[-1]]
+                )  # [s/sp*b*n, h]
+                h_out, _ = deferrable_linear(
+                    self.config, "mtp_h_proj", self.h_proj, hs_flat
+                )  # [s*b*n, h/tp]
+                h_out = h_out.reshape([*orig_shape[:-1], -1])  # [s, b, n, h/tp]
             # Broadcast add before gather (saves one all-gather vs gathering separately)
             hidden_states = e_out.unsqueeze(-2) + h_out
             if self.tensor_parallel > 1:
@@ -1349,6 +1633,14 @@ class MultiTokenPredictionLayer(FleetLayer):
 
         return outputs
 
+    def _sample_mtp_depth(self):
+        """Draw K for this optimizer step.
+
+        Thin wrapper over :func:`draw_mtp_sampled_depth`, which is a pure function
+        of (config.seed, train step) -- see it for why no site needs to coordinate.
+        """
+        return draw_mtp_sampled_depth(self.config)
+
     def forward(self, dict_args: dict):
         # Dispatch by config.use_erndata. Under erndata the data pipeline
         # emits no mtp_startend_row_indices_all / mtp_hidden_inputs_mask_all
@@ -1369,6 +1661,23 @@ class MultiTokenPredictionLayer(FleetLayer):
             assert dict_args["packed_seq_params"] is None, (
                 "multi token prediction + sequence packing is not yet supported."
             )
+
+        # === MTP depth sampling (prefix-length sampling) ===
+        # K is a pure function of (config.seed, train step), so every depth, the
+        # LM head, every rank and every pipeline chunk derive the same value with
+        # no coordination -- and a recompute replay derives it again identically.
+        # dict_args caches it so the later consumers on a stage skip the draw.
+        # Depths >= K return early, skipping their transformer_layer forward; the
+        # LM head then emits None logits for them and the loss drops those entries.
+        if (
+            getattr(self.config, "mtp_depth_sampling", None)
+            and not self.config.enable_mtp_magic_send
+        ):
+            k = resolve_mtp_sampled_depth(self.config, dict_args)
+            if self.layer_number >= k:
+                # Skip this depth entirely: leave hidden_states_concat unchanged
+                # (K stays in dict_args for downstream MTP layers + the LM head).
+                return dict_args
 
         # === MTP input arrives outside hidden_states ===
         # hidden_states is the pure backbone output in both cases. The shifted MTP
@@ -1753,7 +2062,13 @@ class MultiTokenPredictionLayer(FleetLayer):
             )
 
         if self.config.train_mtp_only:
-            for i in range(self.config.num_nextn_predict_layers):
+            sampled_depth = dict_args.get(
+                "mtp_sampled_depth", self.config.num_nextn_predict_layers
+            )
+            num_depths = min(
+                self.config.num_nextn_predict_layers, sampled_depth
+            )
+            for i in range(num_depths):
                 tensor_list = paddle.split(
                     hidden_states_concat,
                     self.config.num_nextn_predict_layers + 1,
@@ -1912,44 +2227,88 @@ class MultiTokenPredictionLayer(FleetLayer):
     # Packed-doc MTP forward (config.use_erndata is True).
     #
     # Contract vs. the historical ernie5 path:
-    #   * The data pipeline emits ONLY the main L-length tensors plus
-    #     cu_seqlens_q. It does NOT emit
-    #     mtp_startend_row_indices_all or mtp_hidden_inputs_mask_all,
-    #     and it does NOT append K MTP tokens to input_ids / labels.
-    #   * The shifted MTP embeddings for each depth are still prepared upstream
-    #     by GPTEmbedding, but using roll_tensor(cu_seqlens_q=...) — i.e.
-    #     per-doc left-shift with boundary zero-fill — rather than the L+K
-    #     index-slice used by ernie5. GPTEmbedding.forward has a mirrored
-    #     use_erndata branch that produces the same
-    #     ``hidden_states_concat`` shape (concatenation of the main slice and
-    #     K per-depth shifted slices), so the pipeline plumbing stays intact.
-    #   * The MTP LMHead / loss layer downstream is responsible for rolling
-    #     labels / loss_mask via roll_tensor before computing MTP loss (M2/M3
-    #     will exercise this end-to-end).
+    #   * The data pipeline emits only the main L-length tensors plus
+    #     cu_seqlens_q; no L+K token append or precomputed per-depth masks.
+    #   * With magic-send off, GPTEmbedding prepares the K packed-rolled
+    #     embeddings and carries K+1 slots through the backbone as before.
+    #   * With magic-send on, GPTEmbedding carries only the 1x backbone hidden
+    #     state plus explicit mtp_full_input_ids/cu_seqlens_q metadata. Each MTP
+    #     stage re-embeds the full IDs, packed-rolls to its depth, and then takes
+    #     the local CP/SP shard; the carrier grows by one output slot per depth.
+    #   * The MTP LMHead/loss keeps cu_seqlens_q to roll labels/loss masks with
+    #     the same packed-document boundaries.
     #
-    # Behaviour inside this method for a given self.layer_number (=depth k):
-    #   1. Split hidden_states_concat (shape [(K+1)*S, B, ...] under SP or
-    #      [B, (K+1)*S, ...] otherwise) into (K+1) chunks along the sequence
-    #      dim.
-    #   2. Take chunk[k] as hidden_states (previous stage's output at this
-    #      depth) and chunk[k+1] as decoder_input (upstream-computed shifted
-    #      embedding at this depth).
-    #   3. Run _proj_and_transformer_layer with:
-    #        - mtp_hidden_inputs_mask=None (no per-doc EOS-derived hidden
-    #          mask; per-doc boundary is expressed via packed_seq_params);
-    #        - attn_mask_startend_row_indices=<main mask> (packed attn still
-    #          consumes the main startend_row_indices — MTP layers inherit
-    #          the same doc boundaries because they share cu_seqlens_q).
-    #   4. Write the resulting hidden_states back into the chunk list at
-    #      position k+1 and re-concat. Return the updated dict_args so the
-    #      next MTP depth can consume its slice.
+    # In both transports, a depth consumes the previous depth's hidden state,
+    # runs _proj_and_transformer_layer with the shared packed attention mask,
+    # and appends or replaces the next carrier slot. Magic metadata is forwarded
+    # only while another MTP depth needs it and never reaches the LMHead.
     #
-    # Constraints: experimental_dataflow=False and enable_mtp_magic_send
-    # disabled (both enforced at TransformerConfig.__post_init__). Context
-    # parallelism is handled at the embedding / loss call sites via
-    # extract_local_cp_chunks (layout picked by config.cp_balance_mode) rather
-    # than inside roll_tensor.
+    # Constraints: experimental_dataflow=False. Context parallelism is handled
+    # via extract_local_cp_chunks (layout picked by config.cp_balance_mode)
+    # after the full-sequence packed roll rather than inside roll_tensor.
     # ------------------------------------------------------------------ #
+
+    def _prepare_erndata_magic_decoder_input(
+        self, full_input_ids, cu_seqlens_q
+    ):
+        """Re-embed full IDs, packed-roll to this depth, then CP/SP shard."""
+        if full_input_ids is None:
+            raise RuntimeError(
+                "use_erndata=True + enable_mtp_magic_send=True requires "
+                "mtp_full_input_ids in pipeline metadata."
+            )
+        if cu_seqlens_q is None:
+            raise RuntimeError(
+                "packed MTP magic send requires cu_seqlens_q in pipeline metadata."
+            )
+
+        decoder_input = self.mtp_embed(full_input_ids).astype(
+            self.mtp_embed.weight.dtype
+        )
+        if (
+            self.config.expert_model_parallel_size > 1
+            and self.config.tensor_model_parallel_size < 2
+            or self.config.gpt_model_use_experimental_version
+        ):
+            from paddlefleet.models.gpt.utils import fill_feature
+
+            pad_token_id = getattr(self.config, "pad_token_id", 0) or 0
+            decoder_input = fill_feature(
+                decoder_input, full_input_ids == pad_token_id, 0
+            )
+        if self.config.fp32_residual_connection:
+            decoder_input = decoder_input.float()
+        for _ in range(self.layer_number + 1):
+            decoder_input, _ = roll_tensor(
+                decoder_input,
+                shifts=-1,
+                dims=1,
+                cu_seqlens_q=cu_seqlens_q,
+            )
+
+        cp_size = get_context_parallel_world_size()
+        if cp_size > 1:
+            cp_rank = get_context_parallel_rank()
+            decoder_input = extract_local_cp_chunks(
+                decoder_input,
+                cp_rank,
+                cp_size,
+                axis=1,
+                mode=self.config.cp_balance_mode,
+            )
+
+        if self.sequence_parallel:
+            # ScatterOp partitions axis 0; transpose to canonical [S, B, H]
+            # first so batches are not interleaved when B > 1.
+            decoder_input = decoder_input.transpose([1, 0, 2]).contiguous()
+            _, batch_size, hidden_size = decoder_input.shape
+            decoder_input = ScatterOp.apply(
+                decoder_input.reshape([-1, hidden_size])
+            )
+            decoder_input = decoder_input.reshape(
+                [-1, batch_size, hidden_size]
+            ).contiguous()
+        return decoder_input
 
     def _forward_megatron_style(self, dict_args: dict) -> dict:
         # Cross-attention is still unsupported (identical constraint as
@@ -1963,17 +2322,16 @@ class MultiTokenPredictionLayer(FleetLayer):
                 "multi token prediction + cross attention is not yet supported "
                 "under use_erndata=True."
             )
-        if (
-            dict_args.get("mtp_input_embeds") is not None
-            or self.config.enable_mtp_magic_send
-        ):
-            # Config validation in TransformerConfig.__post_init__ should have
-            # caught this, but keep a hard guard here for defence in depth.
+        if dict_args.get("mtp_input_embeds") is not None:
             raise ValueError(
-                "use_erndata=True is incompatible with enable_mtp_magic_send."
+                "use_erndata=True does not accept precomputed mtp_input_embeds."
             )
 
         num_nextn = self.config.num_nextn_predict_layers
+        magic_send = self.config.enable_mtp_magic_send
+        mtp_full_input_ids = (
+            dict_args.pop("mtp_full_input_ids", None) if magic_send else None
+        )
 
         # mHC + erndata: the backbone contract layer has already handed over
         # the pre-contraction multi-stream backbone output through
@@ -1992,15 +2350,26 @@ class MultiTokenPredictionLayer(FleetLayer):
             mhc_chunks = paddle.split(mhc_multistream, num_nextn + 1)
 
         hidden_states_concat = dict_args["hidden_states"]
-        tensor_list = paddle.split(hidden_states_concat, num_nextn + 1)
+        if magic_send:
+            # Carrier grows one slot per depth: [main, depth0, ..., depth k-1].
+            # Decoder embeddings are rebuilt locally and never ride P2P.
+            tensor_list = paddle.split(
+                hidden_states_concat, self.layer_number + 1
+            )
+            decoder_input = self._prepare_erndata_magic_decoder_input(
+                mtp_full_input_ids,
+                dict_args.get("cu_seqlens_q"),
+            )
+        else:
+            tensor_list = paddle.split(hidden_states_concat, num_nextn + 1)
+            decoder_input = tensor_list[self.layer_number + 1]
 
         if mhc_chunks is not None:
             # Multi-stream input for the shared mHC block, [B, S, n*h].
             dict_args["hidden_states"] = mhc_chunks[self.layer_number]
         else:
-            # Use previous-stage slices for this depth.
             dict_args["hidden_states"] = tensor_list[self.layer_number]
-        dict_args["decoder_input"] = tensor_list[self.layer_number + 1]
+        dict_args["decoder_input"] = decoder_input
 
         # Drop any leftover ernie5-path fields from dict_args so
         # _proj_and_transformer_layer sees the Megatron contract: no per-depth
@@ -2085,10 +2454,16 @@ class MultiTokenPredictionLayer(FleetLayer):
             if self.layer_number < num_nextn - 1:
                 dict_args["mhc_multistream"] = paddle.concat(mhc_chunks)
 
-        # Store back into the pipeline concat tensor at slot k+1.
-        tensor_list[self.layer_number + 1] = hidden_states
+        # Store this depth in the growing carrier. Non-magic mode has a fixed
+        # K+1 carrier and overwrites its precomputed embedding slot instead.
+        if magic_send:
+            tensor_list.append(hidden_states)
+        else:
+            tensor_list[self.layer_number + 1] = hidden_states
         dict_args["hidden_states"] = paddle.concat(tensor_list)
         dict_args.pop("decoder_input", None)
+        if magic_send and self.layer_number < num_nextn - 1:
+            dict_args["mtp_full_input_ids"] = mtp_full_input_ids
         return dict_args
 
 

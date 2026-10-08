@@ -16,6 +16,7 @@
 import functools
 import hashlib
 import os
+from contextvars import ContextVar
 
 import numpy as np
 import paddle
@@ -28,6 +29,7 @@ from paddle.distributed.fleet.meta_parallel import ScheduleNode
 from paddle.distributed.fleet.utils import recompute
 from paddle.distributed.fleet.utils.sequence_parallel_utils import AllGatherOp
 
+from paddlefleet.accuracy_compatible_patch import LossScaleBeforeBackward
 from paddlefleet.context_parallel_utils import (
     ContextParallelGatherOp,
     ContextParallelScatterOp,
@@ -43,6 +45,11 @@ from paddlefleet.recompute_utils import module_needs_recompute
 from paddlefleet.training.global_vars import get_global_training_logs
 from paddlefleet.transformer.layer import FleetLayer
 from paddlefleet.transformer.transformer_config import TransformerConfig
+from paddlefleet.utils import use_dsv4_accuracy_compatible
+
+# A replay must not notify either the original observer or one installed by a
+# later micro-batch. Context-local state also keeps nested calls isolated.
+_token_loss_replaying = ContextVar("token_loss_replaying", default=False)
 
 
 def _loss_md5_enabled() -> bool:
@@ -201,6 +208,19 @@ def subbatch(
 
 
 class LanguageLoss(FleetLayer):
+    """Language loss with an optional ``_eval_token_loss_hook(loss, labels)``.
+
+    The observer receives unreduced CE before masking/normalization, in the
+    same token layout as the accompanying labels. It runs for the main head
+    and each CE-based MTP head (not the distillation objective), including
+    all-masked inputs. Selective ``loss_fn`` backward recomputation does not
+    notify again. Direct ``forward_impl`` calls each notify independently.
+
+    Observers must not mutate the tensors; detach any values retained for
+    metrics. Return values are ignored and observer exceptions propagate.
+    Head selection/aggregation belongs to the caller.
+    """
+
     # Class-level tracker for MTP loss, read by trainer for logging.
     mtp_loss_tracker: dict[str, float] = {}
 
@@ -308,6 +328,9 @@ class LanguageLoss(FleetLayer):
                     labels, axis=1, mode=self.config.cp_balance_mode
                 )
 
+            observer = getattr(self, "_eval_token_loss_hook", None)
+            if observer is not None and not _token_loss_replaying.get():
+                observer(loss, labels)
             lossmask = labels != self.ignored_index
             if (~lossmask).all():
                 return paddle.mean(loss) * 0.0
@@ -384,6 +407,9 @@ class LanguageLoss(FleetLayer):
                 flush=True,
             )
 
+        observer = getattr(self, "_eval_token_loss_hook", None)
+        if observer is not None and not _token_loss_replaying.get():
+            observer(loss, labels)
         lossmask = labels != self.ignored_index
         if (~lossmask).all():
             loss = paddle.mean(loss) * 0.0
@@ -460,7 +486,11 @@ class LanguageLoss(FleetLayer):
                     (1 - is_invalid_line_float).sum() + 1e-6
                 )
             else:
-                if self.use_accuracy_compatible:
+                if self.use_accuracy_compatible and not (
+                    use_dsv4_accuracy_compatible()
+                    and self.config.experimental_attention_variant
+                    == "dsv4_hybrid"
+                ):
                     _flat = loss.cast(paddle.float32).reshape([-1]) * lossmask
                     loss_sum = (
                         _flat.cast(paddle.float64).sum().cast(paddle.float32)
@@ -510,7 +540,24 @@ class LanguageLoss(FleetLayer):
                 labels, axis=1, mode=self.config.cp_balance_mode
             )
         if module_needs_recompute("loss_fn", None, self.config):
-            return recompute(self.forward_impl, logits, labels)
+            # One lifetime per CE invocation, not a flag on the shared layer:
+            # several heads/micro-batches may await backward simultaneously.
+            # Do not retain token losses or their autograd graphs in the closure.
+            forward_active = True
+
+            def loss_forward(logits, labels):
+                token = _token_loss_replaying.set(
+                    _token_loss_replaying.get() or not forward_active
+                )
+                try:
+                    return self.forward_impl(logits, labels)
+                finally:
+                    _token_loss_replaying.reset(token)
+
+            try:
+                return recompute(loss_forward, logits, labels)
+            finally:
+                forward_active = False
         return self.forward_impl(logits, labels)
 
     def _megatron_label_for_depth(self, labels_ori, depth):
@@ -633,6 +680,12 @@ class LanguageLoss(FleetLayer):
                     lm_loss = self._forward(logits[0], lm_labels)
 
                 for depth in range(self.config.num_nextn_predict_layers):
+                    # MTP depth sampling: the LM head emits None for depths that were
+                    # not computed this step; skip them so mtp_loss holds only the K
+                    # computed depths (the `/ num_mtp` reduction below then averages
+                    # over K). No effect when sampling is off — logits are never None.
+                    if mtp_logits[depth] is None:
+                        continue
                     logits_cur_depth = mtp_logits[depth]
                     if _mtp_is_megatron:
                         # Under use_erndata=True labels_ori is [B, L]
@@ -758,6 +811,21 @@ class LanguageLoss(FleetLayer):
                                 axis=1,
                                 mode=self.config.cp_balance_mode,
                             )
+
+                        # Fused CE already notified inside _forward and returned
+                        # a scalar. Only the direct, unreduced CE path needs this
+                        # notification; callers may choose to consume main only.
+                        if self.config.fused_linear_ce_loss_chunk <= 0:
+                            observer = getattr(
+                                self, "_eval_token_loss_hook", None
+                            )
+                            if (
+                                observer is not None
+                                and not _token_loss_replaying.get()
+                            ):
+                                observer(
+                                    loss_matrix_cur_depth, labels_cur_depth
+                                )
 
                         lossmask_cur_depth = (
                             labels_cur_depth != self.ignored_index
@@ -943,12 +1011,23 @@ class LanguageLoss(FleetLayer):
                 for i, loss_val in enumerate(mtp_loss):
                     logs.update(**{f"mtp_{i + 1}_loss": loss_val.detach()})
 
+            # MTP depth sampling: mtp_loss holds only the computed prefix
+            # (depths 0..len-1). Drop stale tracker entries for the sampled-out deeper
+            # depths so the trainer does not re-log a stale value on those steps —
+            # per-depth curves stay sparse-but-correct instead of flat.
+            for _d in range(
+                len(mtp_loss), self.config.num_nextn_predict_layers
+            ):
+                LanguageLoss.mtp_loss_tracker.pop(f"mtp_{_d + 1}_loss", None)
+
             def add_loss(main_loss, loss):
                 if _use_accuracy_compatible_kernel():
                     # Megatron-aligned: MTP loss gradient flows but loss scalar unchanged.
                     # This matches Megatron's behavior where MTP contributes to training
                     # gradients without affecting the reported loss value.
                     if self.config.add_mtp_loss:
+                        if use_dsv4_accuracy_compatible():
+                            return loss - loss.detach() + main_loss
                         return main_loss + loss - loss.detach()
                     else:
                         return main_loss
@@ -993,10 +1072,15 @@ class LanguageLoss(FleetLayer):
                     * sum(mtp_loss)
                     / len(mtp_loss),
                 )
+            if use_dsv4_accuracy_compatible():
+                loss = LossScaleBeforeBackward.scale(loss)
 
             return loss
         else:
-            return self._forward(logits, labels)
+            loss = self._forward(logits, labels)
+            if use_dsv4_accuracy_compatible():
+                loss = LossScaleBeforeBackward.scale(loss)
+            return loss
 
     def build_schedule_node(self):
         return ScheduleNode(self.forward, name="LanguageLoss")

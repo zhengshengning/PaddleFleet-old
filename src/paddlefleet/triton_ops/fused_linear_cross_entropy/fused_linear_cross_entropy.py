@@ -516,7 +516,13 @@ class LigerFusedLinearCrossEntropyFunction(paddle.autograd.PyLayer):
                 if ctx.ec_align:
                     # The autograd slot and main_grad both want [V, H].
                     grad_weight = grad_weight.T
-                weight._fused_kernel_fp32_grad = grad_weight
+                # The weight may feed several fused CE calls before the hook
+                # fires once on the summed slot grad (e.g. main head + MTP
+                # heads sharing lm_head). Queue every call's grad instead of
+                # overwriting; the hook adds them one by one so the fp32
+                # rounding matches the per-call main_grad.add_ above.
+                prev = getattr(weight, "_fused_kernel_fp32_grad", None)
+                weight._fused_kernel_fp32_grad = (prev or []) + [grad_weight]
 
         # Multimax params: accumulate into main_grad when present (matches
         # the weight pattern); otherwise fall back to returning the grad
@@ -548,7 +554,17 @@ class LigerFusedLinearCrossEntropyFunction(paddle.autograd.PyLayer):
                     # Param was frozen at forward time; respect that here.
                     # Leave mm_*_out as None for this slot.
                     continue
-                if hasattr(param, "main_grad"):
+                if getattr(param, "_fsdp_grad_hooked", False):
+                    # Under FSDP main_grad is owned by the grad hook (it rebinds
+                    # it to a grads-buffer view), so a main_grad.add_ here would
+                    # land in a throwaway tensor. Stash fp32 for the hook, same
+                    # as the weight above; queue across main/MTP heads.
+                    prev = getattr(param, "_fused_kernel_fp32_grad", None)
+                    param._fused_kernel_fp32_grad = (prev or []) + [
+                        g.cast(paddle.float32)
+                    ]
+                    out_grad = paddle.zeros(param.shape, dtype=param.dtype)
+                elif hasattr(param, "main_grad"):
                     if param.main_grad is None:
                         param.main_grad = paddle.zeros(
                             param.shape, dtype=paddle.float32
